@@ -1,0 +1,314 @@
+---
+title: "Assignment 3 - Part 2 - Diagnosing Schizophrenia from Voice"
+author: "Riccardo Fusaroli"
+date: "October 17, 2017"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Assignment 3 - Diagnosing schizophrenia from voice
+
+In the previous part of the assignment you generated a bunch of "features", that is, of quantitative descriptors of voice in schizophrenia, focusing on pitch.
+In the course of this assignment we will use them to try to automatically diagnose schizophrenia from voice only, that is, relying on the set of features you produced last time, we will try to produce an automated classifier.
+
+
+### Question 1
+Build a logistic regression to see whether you can diagnose schizophrenia from pitch range only.
+
+Calculate the different performance measures (accuracy, sensitivity, specificity, PPV, NPV, ROC curve) on a logistic regression using the full dataset. Don't forget the random effects!
+
+Then cross-validate the logistic regression and re-calculate performance on the testing folds. N.B. The cross-validation functions you already have should be tweaked: you need to calculate these new performance measures.
+
+N.B. the predict() function generates probabilities (the full scale between 0 and 1). A probability > .5 indicates a choice of 1, below a choice of 0.
+N.B. you need to decide whether calculate performance on each single test fold or save all the prediction for test folds in one datase, so to calculate overall performance.
+N.B. Now you have two levels of structure: subject and study. Should this impact your cross-validation?
+```{r}
+setwd("~/Documents/RStudioDocs/Assignment2")
+
+library(pacman)
+p_load(tidyverse, stringr, lme4, lmerTest, knitr, caret, e1071, pROC, groupdata2, cvms)
+
+df = read.csv("combinedSchizoData.csv")
+#removing two useless columns
+df$X.1 = NULL
+df$X.2 = NULL
+df$X = NULL
+
+#time is actually trial number
+names(df)[names(df) == "time"] = "trial"
+```
+
+```{r}
+#Creating glm with random slopes for trial and diagnosis and random intercept  for Subject to include the matching controls. 
+#adding random intercept for study
+
+#scaling range and trial
+df$rangeScale = scale(df$range)
+df$trialScale = scale(df$trial)
+
+m1 = glmer(Diagnosis ~ rangeScale + trialScale + (1+trialScale+Diagnosis|Subject) +(1|Study) , df, family = "binomial",  control = glmerControl(calc.derivs = FALSE))
+
+m2 = glmer(Diagnosis ~ rangeScale+ (1+Diagnosis|Subject) +(1|Study) , df, family = "binomial",  control = glmerControl(calc.derivs = FALSE))
+
+m3 = glmer(Diagnosis ~ rangeScale + (1+trial|Subject) +(1|Study) , df, family = "binomial",  control = glmerControl(calc.derivs = FALSE))
+
+m4 = glmer(Diagnosis ~ range  +(1|Study) , df, family = "binomial",  control = glmerControl(calc.derivs = FALSE))
+
+#summaries 
+summary(m1)
+summary(m2)
+summary(m3)
+summary(m4)
+
+# testing model 4 without random effects  
+m5 = glm(Diagnosis ~ range, df, family = 'binomial')
+summary(m5)
+#summary(m1)
+Data1 = df
+
+# taking model 4 because model 5 has no fixed effects 
+Data1$PredictionsPerc=predict(m4)
+Data1$Predictions[Data1$PredictionsPerc<0.00]="Control"
+Data1$Predictions[Data1$PredictionsPerc>=0.00]="Schizophrenia"
+lol = confusionMatrix(data = Data1$Predictions, reference = Data1$Diagnosis, positive = "Schizophrenia") 
+lol
+
+rangemean = df %>% group_by(Diagnosis) %>% summarise(mean = mean(range))
+rangemean %>% kable()
+
+```
+
+```{r}
+
+#ROC curve
+rocCurve <- roc(response = Data1$Diagnosis, predictor = Data1$PredictionsPerc)
+auc(rocCurve)
+ci(rocCurve)
+plot(rocCurve, legacy.axes = T)
+
+```
+
+```{r}
+
+# QUESTION 1 
+#Creating function for automatic crossvalidation. Outputs R2c, R2m and RMSE for each fold, as well the mean values across folds
+cv = function(data, k, model, dependent){
+#confusionList = list()
+#Creating loop
+for (i in 1:k){
+  train = data[data$.folds != i,]    #creating training set (all folds except the one)
+  validation = data[data$.folds == i,] #creating testing/validation set (the current fold)
+  model = glmer(model, train, family = 'binomial', control = glmerControl(calc.derivs = FALSE))   #running glmer on the model specified in the function call
+ validation$PredictionsPerc=predict(model, validation)
+ validation$Predictions[validation$PredictionsPerc<0.00]="Control"
+ validation$Predictions[validation$PredictionsPerc>=0.00]="Schizophrenia"
+ 
+ confusion = confusionMatrix(data = validation$Predictions, reference = validation$Diagnosis, positive = "Schizophrenia")
+ 
+ rocCurve = roc(response = validation$Diagnosis, predictor = validation$PredictionsPerc)
+ auc = auc(rocCurve)
+ aucci = ci(rocCurve)
+ 
+  results = data.frame(Accuracy = confusion$overall[1],
+                          Sensitivity = confusion$byClass[1],
+                          Specificity = confusion$byClass[2],
+                          PPV = confusion$byClass[3],
+                          NPV = confusion$byClass[4],
+                          Precision = confusion$byClass[5],
+                          Recall = confusion$byClass[6],
+                          ConCon = confusion$table[1],
+                          ConSchizo = confusion$table[2],
+                          SchizoCon = confusion$table[3],
+                          SchizoSchizo = confusion$table[4],
+                          AUC = auc[1], #area under curve CI
+                          aucCIlower = aucci[1],
+                          aucCIupper = aucci[3],
+                          row.names = NULL)
+  if(i == 1){
+    result_df = results
+  }else{
+    result_df = rbind(result_df, results)
+  }
+  
+  
+}
+return(result_df)
+}
+
+
+library(groupdata2)
+
+nfolds = 4
+df = fold(df, k=nfolds, cat_col = "Diagnosis", id_col = "Subject")
+m = "Diagnosis ~ range  +(1|Study)"
+m1cv = cv(df, nfolds, m, "Diagnosis")
+m1cv
+
+
+mean_m1cv = m1cv %>% dplyr::summarize(mAccuracy = mean(Accuracy), mSensitivity = mean(Sensitivity), mSpecificty = mean(Specificity), mPPV = mean(PPV), mNPV = mean(NPV), mPrecision = mean(Precision), mRecall = mean(Recall), mConCon = mean(ConCon), mConSchizo = mean(ConSchizo), mSchizoCon = mean(SchizoCon), mSchizoSchizo = mean(SchizoSchizo), mAUC = mean(AUC), mAucCIlower = mean(aucCIlower), mAucCIupper = mean(aucCIupper))
+
+mean_m1cv
+
+
+
+```
+
+
+```{r}
+train = df[df$.folds != 4,]    #creating training set (all folds except the one)
+validation = df[df$.folds == 4,] #creating testing/validation set (the current fold)
+model = glmer(Diagnosis ~ range  +(1|Study) , df, family = "binomial",  control = glmerControl(calc.derivs = FALSE))   #running glmer on the model specified in the function call
+
+df$Study = as.factor(df$Study)
+
+validation$PredictionsPerc = predict(model, validation)
+ 
+ 
+ validation$Predictions[validation$PredictionsPerc<0.00]="Control"
+ validation$Predictions[validation$PredictionsPerc>=0.00]="Schizophrenia"
+ confusionMatrix(data = validation$Predictions, reference = validation$Diagnosis, positive = "Schizophrenia") 
+
+ 
+```
+
+
+### Question 2
+Which single predictor is the best predictor of diagnosis?
+```{r}
+# Question 2 
+# can use ludwigs package to put a list of models in 
+
+# rescaling 
+df = df %>% 
+  group_by(Subject) %>% 
+  mutate(meanS = scale(mean), 
+         medianS = scale(median), 
+         iqrS = scale(iqr), 
+         madS = scale(mad), 
+         RRS = scale(RR), 
+         DETS = scale(DET), 
+         NRLINES = scale(NRLINE), 
+         maxLS = scale(maxL), 
+         LS = scale(L), 
+         ENTRS = scale(ENTR),
+         rENTRS = scale(rENTR), 
+         LAMS = scale(LAM), 
+         TTS = scale(TT), 
+         nsyllS = scale(nsyll), 
+         npauseS = scale(npause), 
+         coefvarS = scale(coefvar))
+
+# cross validation on own data maybe cheating, might be good to check and train on simulated data. 
+set.seed(1) # For reproducibility
+
+# Split data in 25/75(percentage)
+parts <- partition(df, p = 0.25, id_col = "Subject", cat_col = 'Diagnosis')
+
+test <- parts[[1]]
+train <- parts[[2]]
+
+#models 
+models <- c("Diagnosis ~ medianS+(1|Study)",
+            "Diagnosis ~ meanS+(1|Study)",
+            "Diagnosis ~ sd +(1|Study)",
+            "Diagnosis ~ iqrS+(1|Study)",
+            "Diagnosis ~ madS+(1|Study)",
+            "Diagnosis ~ RRS +(1|Study)", 
+            "Diagnosis ~ DETS+(1|Study)", 
+            "Diagnosis ~ NRLINES +(1|Study)", 
+            "Diagnosis ~ maxLS +(1|Study)", 
+            "Diagnosis ~ LS+(1|Study)", 
+            "Diagnosis ~ ENTRS +(1|Study)", 
+            "Diagnosis ~ rENTRS+(1|Study)", 
+            "Diagnosis ~ LAMS+(1|Study)", 
+            "Diagnosis ~ TTS+(1|Study)")
+
+
+CV3 <- cross_validate(train, models, 
+                     folds_col = '.folds', 
+                     family='binomial', 
+                     REML = FALSE)
+
+
+View(CV3)
+max = which.max(CV3$AUC)
+max
+CV3[max,]$Fixed
+
+
+# variable that predicts most area under the curve is mean. 
+# THIS CHNAGESSSSS
+# rate of recurrence in points forming diagonal lines, represents periods in one time series that follow similar paths in thei evolution in another time series 
+
+
+```
+
+The variable that determines diagnosis most differs every time the cross validation is run, so it is hard to pinpoint a specific determining single predictor. For this cross validation, mean is the best predictor for these models. 
+
+### Question 3
+
+Now it's time to go wild! Use all (voice-related) variables and interactions you can think of. Compare models and select the best performing model you can find.
+
+
+```{r}
+
+models2 <- c("Diagnosis ~ meanS + trial + RRS+(1|Study)", 
+            "Diagnosis ~ meanS + trial*RRS+(1|Study)",
+            "Diagnosis ~ medianS + trial +(1|Study)", 
+            "Diagnosis ~ meanS + LS + DETS + coefvarS",
+            "Diagnosis ~ medianS + trial*RRS+(1|Study)",
+            "Diagnosis ~ LAMS+meanS+RRS+(1|Study)", 
+            "Diagnosis ~ trial+medianS+RRS+maxLS+iqrS+DETS+(1|Study)",
+            "Diagnosis ~ medianS + RRS + LS + trial + DETS + iqrS+(1|Study)",
+            "Diagnosis ~ DETS + trial + RRS+(1|Study)", 
+            "Diagnosis ~ maxLS + nsyllS + iqrS +(1|Study)",
+            "Diagnosis ~ medianS + trial + madS +(1|Study)", 
+            "Diagnosis ~ trial + RRS + DETS + (1|Study)", 
+            "Diagnosis ~ meanS + LS + ENTRS+ rENTRS +(1|Study)", 
+            "Diagnosis ~ trial + meanS + medianS+ LAMS + RRS + maxLS + iqrS + madS + ENTRS + DETS + rENTRS + nsyllS + npauseS +  TTS + NRLINES +(1|Study)", 
+            "Diagnosis ~ trial + meanS + LAMS + RRS + maxLS + ENTRS + DETS + rENTRS + nsyllS + TTS +(1|Study)", 
+            "Diagnosis ~ trial + medianS + RRS + maxLS + iqrS + DETS + rENTRS + TTS + NRLINES +(1|Study)", 
+            "Diagnosis ~ meanS + LAMS + RRS + maxLS + iqrS + madS + ENTRS + DETS + rENTRS +  TTS + NRLINES +(1|Study)",
+            "Diagnosis ~ trial + meanS + iqrS + nsyllS + TTS +(1|Study)", 
+            "Diagnosis ~ trial + medianS+ + RRS + nsyllS +  npauseS + (1|Study)")
+
+CV4 <- cross_validate(df, models2, 
+                     folds_col = '.folds', 
+                     family='binomial', 
+                     REML = FALSE)
+
+
+View(CV4)
+
+max = which.max(CV4$AUC)
+max
+CV4[max,]$Fixed
+
+# summary of max model 
+m1 = glmer(Diagnosis ~ meanS+LS+DETS+coefvarS + (1|Study), family = 'binomial', data = df) 
+summary(m1)
+
+
+
+``` 
+
+
+
+### Question 4: Report the results
+
+METHODS SECTION: how did you analyse the data?
+
+
+RESULTS SECTION: can you diagnose schizophrenia based on voice? which features are used? Comment on the difference between the different performance measures.
+
+
+### Bonus question 5
+
+You have some additional bonus data involving speech rate, pauses, etc. Include them in your analysis. Do they improve classification?
+
+### Bonus question 6
+
+Logistic regression is only one of many classification algorithms. Try using others and compare performance. Some examples: Discriminant Function, Random Forest, Support Vector Machine, etc. The package caret provides them.
